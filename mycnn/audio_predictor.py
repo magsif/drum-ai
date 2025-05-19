@@ -1,45 +1,66 @@
 import torch
 import torch.nn.functional as F
+import torchaudio
 from drum_label_map import DrumLabelMap
-import librosa
-import numpy as np
 
 class Predictor:
-    def __init__(self, model, device=None, desired_time_steps=128):
+    def __init__(self, model, device=None, sample_rate=16000, n_mels=64, n_fft=400):
         self.model = model
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
-        self.desired_time_steps = desired_time_steps
+        
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.max_length = int(sample_rate * 1.0)  # 1 second
+
+        # Define transforms once
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=n_fft // 2,
+            n_mels=n_mels
+        )
+        self.db_transform = torchaudio.transforms.AmplitudeToDB()
 
     def predict(self, filepath):
-        # Ladda ljud och beräkna mel-spektrogram på samma sätt som i DrumDataset
-        mel_spec = self._load_audio_to_mel(filepath)  # ska returnera tensor shape [mel_bins, time]
-
-        # Pad eller trimma tidsdimensionen till desired_time_steps
-        time_dim = mel_spec.shape[-1]
-        if time_dim < self.desired_time_steps:
-            pad_amount = self.desired_time_steps - time_dim
-            mel_spec = F.pad(mel_spec, (0, pad_amount))  # pad sista dimensionen till höger
-        elif time_dim > self.desired_time_steps:
-            mel_spec = mel_spec[:, :self.desired_time_steps]  # trimma till önskad längd
-
-        # Lägg till batch- och kanal-dimension
-        mel_spec = mel_spec.unsqueeze(0).unsqueeze(0).to(self.device)  # [1, 1, mel_bins, desired_time_steps]
+        mel_spec = self._load_audio_to_mel(filepath)  # [1, n_mels, time]
+        mel_spec = mel_spec.unsqueeze(0).to(self.device)  # [1, 1, n_mels, time]
 
         with torch.no_grad():
             outputs = self.model(mel_spec)
-            probabilities = torch.softmax(outputs, dim=1).squeeze()
+            probabilities = F.softmax(outputs, dim=1).squeeze()
             pred_index = torch.argmax(probabilities).item()
 
         prediction = DrumLabelMap.categories[pred_index]
-        prob_dict = {DrumLabelMap.categories[i]: probabilities[i].item() for i in range(len(DrumLabelMap.categories))}
+        prob_dict = {DrumLabelMap.categories[i]: float(probabilities[i].cpu()) for i in range(len(DrumLabelMap.categories))}
         return prediction, prob_dict
 
     def _load_audio_to_mel(self, filepath):
-        y, sr = librosa.load(filepath, sr=22050)
-        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64, hop_length=512)
-        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        mel_tensor = torch.tensor(mel_spec_db, dtype=torch.float32)
-        return mel_tensor
+        waveform, sr = torchaudio.load(filepath)
 
+        # Convert to mono
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # Resample if needed
+        if sr != self.sample_rate:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.sample_rate)
+            waveform = resampler(waveform)
+
+        # Pad or trim to 1 second
+        if waveform.shape[1] < self.max_length:
+            padding = self.max_length - waveform.shape[1]
+            waveform = F.pad(waveform, (0, padding))
+        else:
+            waveform = waveform[:, :self.max_length]
+
+        # Compute mel spectrogram
+        mel_spec = self.mel_transform(waveform)
+        mel_spec = self.db_transform(mel_spec)
+
+        # Normalize
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-8)
+
+        return mel_spec
